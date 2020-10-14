@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"github.com/ledgerwatch/turbo-geth/core/rawdb"
 	"runtime"
 	"sort"
 	"strings"
@@ -566,7 +567,7 @@ func stageTxLookup(db ethdb.Database, ctx context.Context) error {
 	return stagedsync.SpawnTxLookup(stage9, db, datadir, ch)
 }
 
-func printAllStages(db ethdb.Database, _ context.Context) error {
+func printAllStages(db rawdb.DatabaseReader, _ context.Context) error {
 	return printStages(db)
 }
 
