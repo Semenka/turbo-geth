@@ -665,6 +665,10 @@ func (tx *lmdbTx) BucketSize(name string) (uint64, error) {
 	return (st.LeafPages + st.BranchPages + st.OverflowPages) * uint64(os.Getpagesize()), nil
 }
 
+func (tx *lmdbTx) BucketStat(name string) (*lmdb.Stat, error) {
+	return tx.tx.Stat(lmdb.DBI(tx.db.buckets[name].DBI))
+}
+
 func (tx *lmdbTx) Cursor(bucket string) Cursor {
 	b := tx.db.buckets[bucket]
 	if b.AutoDupSortKeysConversion {
