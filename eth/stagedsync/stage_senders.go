@@ -107,51 +107,8 @@ func SpawnRecoverSendersStage(cfg Stage3Config, s *StageState, db ethdb.Database
 	log.Info("Sync (Senders): Reading canonical hashes complete", "hashes", len(canonical))
 
 	jobs := make(chan *senderRecoveryJob, cfg.BatchSize)
-	go func() {
-		defer close(jobs)
-
-		if err := db.Walk(dbutils.BlockBodyPrefix, dbutils.EncodeBlockNumber(s.BlockNumber+1), 0, func(k, v []byte) (bool, error) {
-			if err := common.Stopped(quitCh); err != nil {
-				return false, err
-			}
-
-			blockNumber := binary.BigEndian.Uint64(k[:8])
-			blockHash := common.BytesToHash(k[8:])
-			if blockNumber > to {
-				return false, nil
-			}
-
-			if canonical[blockNumber-s.BlockNumber-1] != blockHash {
-				// non-canonical case
-				return true, nil
-			}
-
-			data := make([]byte, len(v))
-			copy(data, v)
-
-			if cfg.Prof || cfg.StartTrace {
-				if blockNumber == uint64(cfg.ToProcess) {
-					// Flush the profiler
-					pprof.StopCPUProfile()
-					//common.SafeClose(quitCh)
-					return false, nil
-				}
-			}
-
-			bodyRlp, err := rawdb.DecompressBlockBody(data)
-			if err != nil {
-				return false, err
-			}
-
-			jobs <- &senderRecoveryJob{bodyRlp: bodyRlp, blockNumber: blockNumber, index: int(blockNumber - s.BlockNumber - 1)}
-
-			return true, nil
-		}); err != nil {
-			log.Error("walking over the block bodies", "error", err)
-		}
-	}()
-
 	out := make(chan *senderRecoveryJob, cfg.BatchSize)
+	log.Info("Sync (Senders): Started recoverer goroutines", "numOfGoroutines", cfg.NumOfGoroutines)
 	wg := new(sync.WaitGroup)
 	wg.Add(cfg.NumOfGoroutines)
 	for i := 0; i < cfg.NumOfGoroutines; i++ {
@@ -161,33 +118,93 @@ func SpawnRecoverSendersStage(cfg Stage3Config, s *StageState, db ethdb.Database
 			recoverSenders(secp256k1.ContextForThread(threadNo), config, jobs, out, quitCh)
 		}(i)
 	}
-	log.Info("Sync (Senders): Started recoverer goroutines", "numOfGoroutines", cfg.NumOfGoroutines)
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
 
-	collector := etl.NewCollector(datadir, etl.NewSortableBuffer(etl.BufferOptimalSize))
 	logEvery := time.NewTicker(30 * time.Second)
 	defer logEvery.Stop()
-	for j := range out {
-		if j.err != nil {
-			return j.err
+
+	collector := etl.NewCollector(datadir, etl.NewSortableBuffer(etl.BufferOptimalSize))
+	errCh := make(chan error)
+	go func() {
+		defer close(errCh)
+		for j := range out {
+			if j.err != nil {
+				errCh <- j.err
+				return
+			}
+			if err := common.Stopped(quitCh); err != nil {
+				errCh <- j.err
+				return
+			}
+			select {
+			default:
+			case <-logEvery.C:
+				log.Info("Senders recovery", "block", j.index)
+			}
+			k := make([]byte, 4)
+			binary.BigEndian.PutUint32(k, uint32(j.index))
+			if err := collector.Collect(k, j.senders); err != nil {
+				errCh <- j.err
+				return
+			}
 		}
+	}()
+
+	if err := db.Walk(dbutils.BlockBodyPrefix, dbutils.EncodeBlockNumber(s.BlockNumber+1), 0, func(k, v []byte) (bool, error) {
 		if err := common.Stopped(quitCh); err != nil {
-			return err
+			return false, err
 		}
-		k := make([]byte, 4)
+
+		blockNumber := binary.BigEndian.Uint64(k[:8])
+		blockHash := common.BytesToHash(k[8:])
+		if blockNumber > to {
+			return false, nil
+		}
+
+		if canonical[blockNumber-s.BlockNumber-1] != blockHash {
+			// non-canonical case
+			return true, nil
+		}
+
+		data := make([]byte, len(v))
+		copy(data, v)
+
+		if cfg.Prof || cfg.StartTrace {
+			if blockNumber == uint64(cfg.ToProcess) {
+				// Flush the profiler
+				pprof.StopCPUProfile()
+				//common.SafeClose(quitCh)
+				return false, nil
+			}
+		}
+
+		bodyRlp, err := rawdb.DecompressBlockBody(data)
+		if err != nil {
+			return false, err
+		}
+
 		select {
-		default:
-		case <-logEvery.C:
-			log.Info("Senders recovery", "block", j.index)
+		case err := <-errCh:
+			if err != nil {
+				return false, err
+			}
+		case jobs <- &senderRecoveryJob{bodyRlp: bodyRlp, blockNumber: blockNumber, index: int(blockNumber - s.BlockNumber - 1)}:
 		}
-		binary.BigEndian.PutUint32(k, uint32(j.index))
-		if err := collector.Collect(k, j.senders); err != nil {
+
+		return true, nil
+	}); err != nil {
+		log.Error("walking over the block bodies", "error", err)
+		return err
+	}
+
+	close(jobs)
+	wg.Wait()
+	close(out)
+	for err := range errCh {
+		if err != nil {
 			return err
 		}
 	}
+
 	loadFunc := func(k []byte, value []byte, _ etl.State, next etl.LoadNextFunc) error {
 		index := int(binary.BigEndian.Uint32(k))
 		return next(k, dbutils.BlockBodyKey(s.BlockNumber+uint64(index)+1, canonical[index]), value)

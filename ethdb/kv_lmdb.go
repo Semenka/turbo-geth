@@ -498,7 +498,7 @@ func (tx *lmdbTx) dropEvenIfBucketIsNotDeprecated(name string) error {
 
 func (tx *lmdbTx) ClearBucket(bucket string) error {
 	if err := tx.dropEvenIfBucketIsNotDeprecated(bucket); err != nil {
-		return nil
+		return err
 	}
 	return tx.CreateBucket(bucket)
 }
@@ -666,6 +666,9 @@ func (tx *lmdbTx) BucketSize(name string) (uint64, error) {
 }
 
 func (tx *lmdbTx) BucketStat(name string) (*lmdb.Stat, error) {
+	if name == "freelist" || name == "gc" || name == "free_list" { //nolint:goconst
+		return tx.tx.Stat(lmdb.DBI(0))
+	}
 	return tx.tx.Stat(lmdb.DBI(tx.db.buckets[name].DBI))
 }
 
